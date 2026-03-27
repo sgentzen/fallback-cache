@@ -31,4 +31,4 @@ jobs:
         run: mypy src/fallback_cache/
 
       - name: Test
-        run: pytest --cov=fallback_cache --cov-report=term-missing -v
+        run: pytest --cov=fallback_cache --cov-report=term-missing --cov-fail-under=90 -v
