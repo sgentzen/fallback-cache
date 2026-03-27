@@ -12,7 +12,7 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
-def _DEFAULT_SERIALIZER(data: Any) -> str:  # noqa: N802
+def _default_serializer(data: Any) -> str:
     return json.dumps(data, default=str)
 
 
@@ -33,7 +33,7 @@ class FallbackCache:
         default_ttl: int = 300,
         max_entries: int = 100,
         key_prefix: str = "",
-        serializer: Callable[[Any], str | bytes] = _DEFAULT_SERIALIZER,
+        serializer: Callable[[Any], str | bytes] = _default_serializer,
         deserializer: Callable[[str | bytes], Any] = _DEFAULT_DESERIALIZER,
     ) -> None:
         if default_ttl <= 0:
@@ -127,7 +127,7 @@ class FallbackCache:
                 )
 
         # Always clean memory
-        to_delete = [k for k in list(self._cache.keys()) if k.startswith(full_prefix)]
+        to_delete = [k for k in self._cache.keys() if k.startswith(full_prefix)]
         for k in to_delete:
             self._memory_delete(k)
 
