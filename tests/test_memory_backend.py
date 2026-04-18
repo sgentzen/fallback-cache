@@ -56,7 +56,9 @@ def test_ttl_expiration():
     cache.set("key1", "value1")
     # Simulate time passing beyond TTL
     full_key = cache._full_key("key1")
-    cache._timestamps[full_key] -= 20  # 20s ago, TTL is 10s
+    # Backdate stored_at so the entry appears 20 s old (TTL is 10 s)
+    entry = cache._cache[full_key]
+    cache._cache[full_key] = entry._replace(stored_at=entry.stored_at - 20)
     assert cache.get("key1") is None
 
 
@@ -64,8 +66,10 @@ def test_per_key_ttl_overrides_default():
     cache = FallbackCache(default_ttl=10)
     cache.set("short", "val", ttl=1)
     cache.set("long", "val", ttl=9999)
-    for k in list(cache._timestamps):
-        cache._timestamps[k] -= 5
+    # Backdate stored_at by 5 s so "short" (ttl=1) expires but "long" (ttl=9999) does not
+    for k in list(cache._cache):
+        entry = cache._cache[k]
+        cache._cache[k] = entry._replace(stored_at=entry.stored_at - 5)
     assert cache.get("short") is None
     assert cache.get("long") == "val"
 

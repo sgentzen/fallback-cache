@@ -61,4 +61,4 @@ def test_serializer_error_does_not_prevent_memory_write():
     )
     cache.set("k", {"v": 1})
     full_key = cache._full_key("k")
-    assert cache._cache[full_key] == {"v": 1}
+    assert cache._cache[full_key].value == {"v": 1}

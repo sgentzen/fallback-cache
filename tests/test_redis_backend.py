@@ -51,7 +51,7 @@ def test_invalidate_prefix_scans_and_deletes(mock_redis):
 def test_set_dual_writes_to_memory(mock_redis):
     cache = FallbackCache(redis_client=mock_redis, default_ttl=300)
     cache.set("key1", {"name": "Alice"})
-    assert cache._cache["key1"] == {"name": "Alice"}
+    assert cache._cache["key1"].value == {"name": "Alice"}
 
 
 def test_stats_redis_mode(mock_redis):

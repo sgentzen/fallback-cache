@@ -31,7 +31,7 @@ def test_set_stores_in_memory_when_redis_fails():
     cache = FallbackCache(redis_client=redis, default_ttl=300)
     cache.set("key1", "value1")
     full_key = cache._full_key("key1")
-    assert cache._cache[full_key] == "value1"
+    assert cache._cache[full_key].value == "value1"
 
 
 def test_get_after_set_with_redis_down():

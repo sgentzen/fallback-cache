@@ -4,10 +4,11 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import threading
 from collections import OrderedDict
 from collections.abc import Callable
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, NamedTuple
 
 logger = logging.getLogger(__name__)
 
@@ -17,6 +18,14 @@ def _DEFAULT_SERIALIZER(data: Any) -> str:  # noqa: N802
 
 
 _DEFAULT_DESERIALIZER: Callable[[str | bytes], Any] = json.loads
+
+
+class _Entry(NamedTuple):
+    """Single in-memory cache record."""
+
+    value: Any
+    stored_at: float  # UTC epoch float at write time (see M3 for monotonic switch)
+    ttl: int          # seconds until expiry
 
 
 class FallbackCache:
@@ -46,10 +55,11 @@ class FallbackCache:
         self._serializer = serializer
         self._deserializer = deserializer
 
-        # In-memory backend: OrderedDict for LRU ordering (most-recently-used at end)
-        self._cache: OrderedDict[str, Any] = OrderedDict()
-        self._timestamps: dict[str, float] = {}
-        self._ttls: dict[str, int] = {}
+        # In-memory backend: single OrderedDict for LRU ordering (MRU at end).
+        # RLock because public methods (e.g. set) may hold the lock while
+        # calling internal helpers (_memory_set) that also acquire it.
+        self._lock = threading.RLock()
+        self._cache: OrderedDict[str, _Entry] = OrderedDict()
 
         # Tracks every full key successfully written to Redis (survives LRU eviction)
         self._redis_keys: set[str] = set()
@@ -128,57 +138,67 @@ class FallbackCache:
                         self._redis.delete(*keys)
                     if cursor == 0:
                         break
-                self._redis_keys = {k for k in self._redis_keys if not k.startswith(full_prefix)}
+                with self._lock:
+                    self._redis_keys = {
+                        k for k in self._redis_keys if not k.startswith(full_prefix)
+                    }
             except Exception:
                 logger.warning(
                     "Redis invalidate_prefix failed for prefix %r", full_prefix, exc_info=True
                 )
 
         # Always clean memory
-        to_delete = [k for k in list(self._cache.keys()) if k.startswith(full_prefix)]
-        for k in to_delete:
-            self._memory_delete(k)
+        with self._lock:
+            to_delete = [k for k in list(self._cache.keys()) if k.startswith(full_prefix)]
+            for k in to_delete:
+                self._cache.pop(k, None)
 
     def clear(self) -> None:
         """Remove all entries from both backends.
 
         Deletes only the keys tracked by this cache instance rather than
-        flushing the entire Redis database.
+        flushing the entire Redis database. If the Redis delete call raises,
+        the in-memory store is still cleared; a subsequent clear() will
+        retry the Redis deletion using the still-populated _redis_keys set.
         """
-        if self._redis is not None:
+        # Snapshot + memory clear in one lock block so no concurrent set() can
+        # slip a key into _cache after we've cleared it.
+        with self._lock:
             keys_to_delete = list(self._redis_keys | set(self._cache.keys()))
-            if keys_to_delete:
-                try:
-                    self._redis.delete(*keys_to_delete)
-                    self._redis_keys.clear()
-                except Exception:
-                    logger.warning("Redis delete failed during clear()", exc_info=True)
+            self._cache.clear()
 
-        self._cache.clear()
-        self._timestamps.clear()
-        self._ttls.clear()
+        # Redis I/O outside the lock; subtract only what we successfully deleted
+        # so any keys added by a concurrent set() after the snapshot are retained.
+        if self._redis is not None and keys_to_delete:
+            try:
+                self._redis.delete(*keys_to_delete)
+                with self._lock:
+                    self._redis_keys -= set(keys_to_delete)
+            except Exception:
+                logger.warning("Redis delete failed during clear()", exc_info=True)
 
     def stats(self) -> dict[str, Any]:
         """Return runtime statistics for the cache."""
-        if self._redis is not None:
+        with self._lock:
+            if self._redis is not None:
+                return {
+                    "backend": "redis",
+                    "memory_entries": len(self._cache),
+                    "key_prefix": self._key_prefix,
+                }
+
+            oldest_age: float | None = None
+            if self._cache:
+                now = datetime.now(timezone.utc).timestamp()
+                oldest_ts = min(e.stored_at for e in self._cache.values())
+                oldest_age = now - oldest_ts
+
             return {
-                "backend": "redis",
-                "memory_entries": len(self._cache),
-                "key_prefix": self._key_prefix,
+                "backend": "memory",
+                "entries": len(self._cache),
+                "max_entries": self._max_entries,
+                "oldest_age_seconds": oldest_age,
             }
-
-        oldest_age: float | None = None
-        if self._timestamps:
-            now = datetime.now(timezone.utc).timestamp()
-            oldest_ts = min(self._timestamps.values())
-            oldest_age = now - oldest_ts
-
-        return {
-            "backend": "memory",
-            "entries": len(self._cache),
-            "max_entries": self._max_entries,
-            "oldest_age_seconds": oldest_age,
-        }
 
     # ------------------------------------------------------------------
     # Key helpers
@@ -195,6 +215,9 @@ class FallbackCache:
         None-valued params are excluded. Remaining params are sorted,
         JSON-serialized, and SHA-256 hashed (first 12 hex chars).
         Returns 'prefix:<hash>'.
+
+        Params must be JSON-serializable. Unhashable or non-serializable
+        values (sets, custom objects without a useful __str__) raise TypeError.
         """
         filtered = {k: v for k, v in params.items() if v is not None}
         canonical = json.dumps(filtered, sort_keys=True, default=str)
@@ -207,42 +230,40 @@ class FallbackCache:
 
     def _memory_set(self, full_key: str, data: Any, ttl: int) -> None:
         """Write to in-memory LRU cache, evicting LRU entry if at capacity."""
-        # If key already exists, remove it so we can re-insert at end (most recent)
-        if full_key in self._cache:
-            del self._cache[full_key]
-        elif len(self._cache) >= self._max_entries:
-            # Evict the least-recently-used (first) entry
-            evicted_key, _ = self._cache.popitem(last=False)
-            self._timestamps.pop(evicted_key, None)
-            self._ttls.pop(evicted_key, None)
+        with self._lock:
+            if full_key in self._cache:
+                del self._cache[full_key]
+            elif len(self._cache) >= self._max_entries:
+                # Evict the least-recently-used (first) entry
+                self._cache.popitem(last=False)
 
-        self._cache[full_key] = data
-        self._timestamps[full_key] = datetime.now(timezone.utc).timestamp()
-        self._ttls[full_key] = ttl
+            self._cache[full_key] = _Entry(
+                value=data,
+                stored_at=datetime.now(timezone.utc).timestamp(),
+                ttl=ttl,
+            )
 
     def _memory_get(self, full_key: str) -> Any | None:
         """Read from in-memory cache with lazy TTL expiry and LRU promotion."""
-        if full_key not in self._cache:
-            return None
-
-        # Lazy TTL expiry
-        stored_at = self._timestamps.get(full_key)
-        ttl = self._ttls.get(full_key, self._default_ttl)
-        if stored_at is not None:
-            age = datetime.now(timezone.utc).timestamp() - stored_at
-            if age >= ttl:
-                self._memory_delete(full_key)
+        with self._lock:
+            entry = self._cache.get(full_key)
+            if entry is None:
                 return None
 
-        # Promote to most-recently-used position
-        self._cache.move_to_end(full_key)
-        return self._cache[full_key]
+            # Lazy TTL expiry
+            age = datetime.now(timezone.utc).timestamp() - entry.stored_at
+            if age >= entry.ttl:
+                del self._cache[full_key]
+                return None
+
+            # Promote to most-recently-used position
+            self._cache.move_to_end(full_key)
+            return entry.value
 
     def _memory_delete(self, full_key: str) -> bool:
         """Remove a single key from in-memory storage. Returns True if it existed."""
-        if full_key not in self._cache:
-            return False
-        del self._cache[full_key]
-        self._timestamps.pop(full_key, None)
-        self._ttls.pop(full_key, None)
-        return True
+        with self._lock:
+            if full_key not in self._cache:
+                return False
+            del self._cache[full_key]
+            return True
