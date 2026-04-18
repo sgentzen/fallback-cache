@@ -51,6 +51,9 @@ class FallbackCache:
         self._timestamps: dict[str, float] = {}
         self._ttls: dict[str, int] = {}
 
+        # Tracks every full key successfully written to Redis (survives LRU eviction)
+        self._redis_keys: set[str] = set()
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -67,6 +70,7 @@ class FallbackCache:
         if self._redis is not None:
             try:
                 self._redis.setex(full_key, effective_ttl, self._serializer(data))
+                self._redis_keys.add(full_key)
             except Exception:
                 logger.warning("Redis set failed for key %r", full_key, exc_info=True)
 
@@ -97,8 +101,9 @@ class FallbackCache:
         if self._redis is not None:
             try:
                 count = self._redis.delete(full_key)
-                if count and count > 0:
+                if count:
                     existed = True
+                self._redis_keys.discard(full_key)
             except Exception:
                 logger.warning("Redis delete failed for key %r", full_key, exc_info=True)
 
@@ -110,6 +115,8 @@ class FallbackCache:
     def invalidate_prefix(self, prefix: str) -> None:
         """Delete all keys whose full key starts with key_prefix + prefix."""
         full_prefix = self._key_prefix + prefix
+        if not full_prefix:
+            raise ValueError("invalidate_prefix requires a non-empty prefix or key_prefix")
 
         if self._redis is not None:
             try:
@@ -121,6 +128,7 @@ class FallbackCache:
                         self._redis.delete(*keys)
                     if cursor == 0:
                         break
+                self._redis_keys = {k for k in self._redis_keys if not k.startswith(full_prefix)}
             except Exception:
                 logger.warning(
                     "Redis invalidate_prefix failed for prefix %r", full_prefix, exc_info=True
@@ -138,10 +146,11 @@ class FallbackCache:
         flushing the entire Redis database.
         """
         if self._redis is not None:
-            keys_to_delete = list(self._cache.keys())
+            keys_to_delete = list(self._redis_keys | set(self._cache.keys()))
             if keys_to_delete:
                 try:
                     self._redis.delete(*keys_to_delete)
+                    self._redis_keys.clear()
                 except Exception:
                     logger.warning("Redis delete failed during clear()", exc_info=True)
 

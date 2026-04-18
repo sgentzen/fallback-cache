@@ -70,3 +70,27 @@ def test_key_prefix_applied_to_redis(mock_redis):
     cache.set("key1", "value")
     args = mock_redis.setex.call_args
     assert args[0][0] == "app:key1"
+
+
+def test_clear_deletes_evicted_redis_keys(mock_redis):
+    """clear() must delete Redis keys that were LRU-evicted from in-memory store."""
+    max_entries = 3
+    cache = FallbackCache(redis_client=mock_redis, default_ttl=300, max_entries=max_entries)
+
+    # Write more keys than max_entries so early keys are evicted from memory
+    total = max_entries + 2
+    for i in range(total):
+        cache.set(f"key{i}", i)
+
+    # The first two keys were evicted from _cache but should still be in _redis_keys
+    assert len(cache._cache) == max_entries
+    assert len(cache._redis_keys) == total
+
+    cache.clear()
+
+    # All keys — including evicted ones — must have been passed to Redis delete
+    all_deleted: set[str] = set()
+    for call in mock_redis.delete.call_args_list:
+        all_deleted.update(call[0])
+    for i in range(total):
+        assert f"key{i}" in all_deleted
