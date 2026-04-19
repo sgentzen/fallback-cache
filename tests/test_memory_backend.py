@@ -127,6 +127,24 @@ def test_stats_memory_mode():
     assert "oldest_age_seconds" in stats
 
 
+def test_stats_oldest_age_seconds_monotonic():
+    """oldest_age_seconds reflects time elapsed since the oldest entry was written."""
+    cache = FallbackCache(default_ttl=300)
+    cache.set("early", "value")
+    full_key = cache._full_key("early")
+
+    # Backdate the oldest entry's stored_at by a known delta
+    backdated_seconds = 42.0
+    entry = cache._cache[full_key]
+    cache._cache[full_key] = entry._replace(stored_at=entry.stored_at - backdated_seconds)
+
+    stats = cache.stats()
+    age = stats["oldest_age_seconds"]
+    assert isinstance(age, float), f"expected float, got {type(age)}"
+    assert age >= backdated_seconds, f"age {age:.2f}s < expected {backdated_seconds}s"
+    assert age < backdated_seconds + 5, f"age {age:.2f}s implausibly large (clock mismatch?)"
+
+
 def test_key_prefix_prepended():
     cache = FallbackCache(default_ttl=300, key_prefix="myapp:")
     cache.set("key1", "value1")

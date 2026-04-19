@@ -1,22 +1,20 @@
 """FallbackCache — Redis-primary cache with transparent in-memory LRU fallback."""
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import logging
 import threading
+import time
 from collections import OrderedDict
 from collections.abc import Callable
-from datetime import datetime, timezone
 from typing import Any, NamedTuple
 
 logger = logging.getLogger(__name__)
 
 
-def _DEFAULT_SERIALIZER(data: Any) -> str:  # noqa: N802
-    return json.dumps(data, default=str)
-
-
+_DEFAULT_SERIALIZER: Callable[[Any], str] = functools.partial(json.dumps, default=str)
 _DEFAULT_DESERIALIZER: Callable[[str | bytes], Any] = json.loads
 
 
@@ -24,7 +22,7 @@ class _Entry(NamedTuple):
     """Single in-memory cache record."""
 
     value: Any
-    stored_at: float  # UTC epoch float at write time (see M3 for monotonic switch)
+    stored_at: float  # time.monotonic() at write time
     ttl: int          # seconds until expiry
 
 
@@ -189,7 +187,7 @@ class FallbackCache:
 
             oldest_age: float | None = None
             if self._cache:
-                now = datetime.now(timezone.utc).timestamp()
+                now = time.monotonic()
                 oldest_ts = min(e.stored_at for e in self._cache.values())
                 oldest_age = now - oldest_ts
 
@@ -239,7 +237,7 @@ class FallbackCache:
 
             self._cache[full_key] = _Entry(
                 value=data,
-                stored_at=datetime.now(timezone.utc).timestamp(),
+                stored_at=time.monotonic(),
                 ttl=ttl,
             )
 
@@ -251,7 +249,7 @@ class FallbackCache:
                 return None
 
             # Lazy TTL expiry
-            age = datetime.now(timezone.utc).timestamp() - entry.stored_at
+            age = time.monotonic() - entry.stored_at
             if age >= entry.ttl:
                 del self._cache[full_key]
                 return None
