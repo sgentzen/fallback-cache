@@ -62,6 +62,10 @@ class FallbackCache:
         # Tracks every full key successfully written to Redis (survives LRU eviction)
         self._redis_keys: set[str] = set()
 
+        # Redis health counters (best-effort; always updated under self._lock)
+        self._redis_failures: int = 0
+        self._redis_last_error: str | None = None
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -74,13 +78,19 @@ class FallbackCache:
 
         full_key = self._full_key(key)
 
-        # Try Redis first (best-effort)
+        # Try Redis first (best-effort).
+        # Serialization happens outside the try so a TypeError from bad input
+        # propagates to the caller rather than being miscounted as a Redis failure.
         if self._redis is not None:
+            serialized = self._serializer(data)
             try:
-                self._redis.setex(full_key, effective_ttl, self._serializer(data))
+                self._redis.setex(full_key, effective_ttl, serialized)
                 self._redis_keys.add(full_key)
-            except Exception:
+            except Exception as exc:
                 logger.warning("Redis set failed for key %r", full_key, exc_info=True)
+                with self._lock:
+                    self._redis_failures += 1
+                    self._redis_last_error = repr(exc)
 
         # Always write to in-memory
         self._memory_set(full_key, data, effective_ttl)
@@ -96,8 +106,11 @@ class FallbackCache:
                 if raw is not None:
                     return self._deserializer(raw)
                 # Redis miss — fall through to memory
-            except Exception:
+            except Exception as exc:
                 logger.warning("Redis get failed for key %r", full_key, exc_info=True)
+                with self._lock:
+                    self._redis_failures += 1
+                    self._redis_last_error = repr(exc)
 
         return self._memory_get(full_key)
 
@@ -112,8 +125,11 @@ class FallbackCache:
                 if count:
                     existed = True
                 self._redis_keys.discard(full_key)
-            except Exception:
+            except Exception as exc:
                 logger.warning("Redis delete failed for key %r", full_key, exc_info=True)
+                with self._lock:
+                    self._redis_failures += 1
+                    self._redis_last_error = repr(exc)
 
         if self._memory_delete(full_key):
             existed = True
@@ -140,10 +156,13 @@ class FallbackCache:
                     self._redis_keys = {
                         k for k in self._redis_keys if not k.startswith(full_prefix)
                     }
-            except Exception:
+            except Exception as exc:
                 logger.warning(
                     "Redis invalidate_prefix failed for prefix %r", full_prefix, exc_info=True
                 )
+                with self._lock:
+                    self._redis_failures += 1
+                    self._redis_last_error = repr(exc)
 
         # Always clean memory
         with self._lock:
@@ -172,8 +191,11 @@ class FallbackCache:
                 self._redis.delete(*keys_to_delete)
                 with self._lock:
                     self._redis_keys -= set(keys_to_delete)
-            except Exception:
+            except Exception as exc:
                 logger.warning("Redis delete failed during clear()", exc_info=True)
+                with self._lock:
+                    self._redis_failures += 1
+                    self._redis_last_error = repr(exc)
 
     def stats(self) -> dict[str, Any]:
         """Return runtime statistics for the cache."""
@@ -183,6 +205,8 @@ class FallbackCache:
                     "backend": "redis",
                     "memory_entries": len(self._cache),
                     "key_prefix": self._key_prefix,
+                    "redis_failures": self._redis_failures,
+                    "redis_last_error": self._redis_last_error,
                 }
 
             oldest_age: float | None = None
@@ -212,13 +236,15 @@ class FallbackCache:
 
         None-valued params are excluded. Remaining params are sorted,
         JSON-serialized, and SHA-256 hashed (first 12 hex chars).
-        Returns 'prefix:<hash>'.
+        Returns ``'prefix:<hash>'``.
 
-        Params must be JSON-serializable. Unhashable or non-serializable
-        values (sets, custom objects without a useful __str__) raise TypeError.
+        **Param contract:** all values must be JSON-serializable (str, int,
+        float, bool, None, list, dict with string keys). Sets, bare objects,
+        and other non-serializable types will raise ``TypeError``. If you need
+        to include a custom type, convert it to a string or dict first.
         """
         filtered = {k: v for k, v in params.items() if v is not None}
-        canonical = json.dumps(filtered, sort_keys=True, default=str)
+        canonical = json.dumps(filtered, sort_keys=True)
         digest = hashlib.sha256(canonical.encode()).hexdigest()[:12]
         return f"{prefix}:{digest}"
 
