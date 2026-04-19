@@ -2,6 +2,8 @@
 import json
 from unittest.mock import MagicMock
 
+import pytest
+
 from fallback_cache import FallbackCache
 
 
@@ -29,7 +31,7 @@ def test_set_stores_in_memory_when_redis_fails():
     cache = FallbackCache(redis_client=redis, default_ttl=300)
     cache.set("key1", "value1")
     full_key = cache._full_key("key1")
-    assert cache._cache[full_key] == "value1"
+    assert cache._cache[full_key].value == "value1"
 
 
 def test_get_after_set_with_redis_down():
@@ -85,3 +87,20 @@ def test_dual_write_healthy_redis():
     cache.set("key1", "value1")
     redis.setex.assert_called_once()
     assert "key1" in cache._cache
+
+
+def test_invalidate_prefix_raises_on_empty_prefix():
+    """invalidate_prefix with empty prefix and no key_prefix would wipe the DB."""
+    cache = FallbackCache(default_ttl=300)
+    with pytest.raises(ValueError, match="non-empty prefix"):
+        cache.invalidate_prefix("")
+
+
+def test_invalidate_prefix_empty_prefix_with_key_prefix_is_allowed():
+    """key_prefix alone is sufficient to scope the operation."""
+    cache = FallbackCache(default_ttl=300, key_prefix="app:")
+    cache.set("users:1", "alice")
+    cache.set("users:2", "bob")
+    cache.invalidate_prefix("")  # full_prefix == "app:" — safe
+    assert cache.get("users:1") is None
+    assert cache.get("users:2") is None

@@ -51,7 +51,7 @@ def test_invalidate_prefix_scans_and_deletes(mock_redis):
 def test_set_dual_writes_to_memory(mock_redis):
     cache = FallbackCache(redis_client=mock_redis, default_ttl=300)
     cache.set("key1", {"name": "Alice"})
-    assert cache._cache["key1"] == {"name": "Alice"}
+    assert cache._cache["key1"].value == {"name": "Alice"}
 
 
 def test_stats_redis_mode(mock_redis):
@@ -60,9 +60,92 @@ def test_stats_redis_mode(mock_redis):
     stats = cache.stats()
     assert stats["backend"] == "redis"
     assert stats["memory_entries"] == 1
-    # Verify NO extra keys like "entries" or "max_entries"
+    assert stats["redis_failures"] == 0
+    assert stats["redis_last_error"] is None
+    # Verify NO memory-mode keys bleed through
     assert "entries" not in stats
     assert "max_entries" not in stats
+
+
+def test_stats_reports_redis_failures():
+    """stats() exposes redis_failures and redis_last_error after failed Redis ops."""
+    from unittest.mock import MagicMock
+
+    redis = MagicMock()
+    redis.setex.side_effect = ConnectionError("Redis down")
+    redis.get.side_effect = ConnectionError("Redis down")
+    cache = FallbackCache(redis_client=redis, default_ttl=300)
+
+    cache.set("key1", "value")   # set fails → failure #1
+    cache.get("key1")             # get fails → failure #2
+
+    stats = cache.stats()
+    assert stats["redis_failures"] == 2
+    assert stats["redis_last_error"] is not None
+    assert "ConnectionError" in stats["redis_last_error"]
+
+
+def test_stats_redis_failures_reset_not_expected_after_success():
+    """Failure counter accumulates; a successful op does not reset it."""
+    from unittest.mock import MagicMock
+
+    redis = MagicMock()
+    redis.setex.side_effect = [ConnectionError("Redis down"), None]
+    redis.get.return_value = None
+    cache = FallbackCache(redis_client=redis, default_ttl=300)
+
+    cache.set("key1", "bad")    # fails → counter = 1
+    cache.set("key2", "good")   # succeeds → counter stays at 1
+
+    assert cache.stats()["redis_failures"] == 1
+
+
+def test_stats_redis_failure_on_delete():
+    """delete() Redis failure is reflected in the failure counter."""
+    from unittest.mock import MagicMock
+
+    redis = MagicMock()
+    redis.setex.return_value = None
+    redis.delete.side_effect = ConnectionError("Redis down")
+    cache = FallbackCache(redis_client=redis, default_ttl=300)
+    cache.set("key1", "value")
+    cache.delete("key1")
+
+    stats = cache.stats()
+    assert stats["redis_failures"] == 1
+    assert "ConnectionError" in stats["redis_last_error"]
+
+
+def test_stats_redis_failure_on_invalidate_prefix():
+    """invalidate_prefix() Redis failure is reflected in the failure counter."""
+    from unittest.mock import MagicMock
+
+    redis = MagicMock()
+    redis.setex.return_value = None
+    redis.scan.side_effect = ConnectionError("Redis down")
+    cache = FallbackCache(redis_client=redis, default_ttl=300, key_prefix="ns:")
+    cache.set("key1", "value")
+    cache.invalidate_prefix("key")
+
+    stats = cache.stats()
+    assert stats["redis_failures"] == 1
+    assert "ConnectionError" in stats["redis_last_error"]
+
+
+def test_stats_redis_failure_on_clear():
+    """clear() Redis failure is reflected in the failure counter."""
+    from unittest.mock import MagicMock
+
+    redis = MagicMock()
+    redis.setex.return_value = None
+    redis.delete.side_effect = ConnectionError("Redis down")
+    cache = FallbackCache(redis_client=redis, default_ttl=300)
+    cache.set("key1", "value")
+    cache.clear()
+
+    stats = cache.stats()
+    assert stats["redis_failures"] == 1
+    assert "ConnectionError" in stats["redis_last_error"]
 
 
 def test_key_prefix_applied_to_redis(mock_redis):
@@ -70,3 +153,27 @@ def test_key_prefix_applied_to_redis(mock_redis):
     cache.set("key1", "value")
     args = mock_redis.setex.call_args
     assert args[0][0] == "app:key1"
+
+
+def test_clear_deletes_evicted_redis_keys(mock_redis):
+    """clear() must delete Redis keys that were LRU-evicted from in-memory store."""
+    max_entries = 3
+    cache = FallbackCache(redis_client=mock_redis, default_ttl=300, max_entries=max_entries)
+
+    # Write more keys than max_entries so early keys are evicted from memory
+    total = max_entries + 2
+    for i in range(total):
+        cache.set(f"key{i}", i)
+
+    # The first two keys were evicted from _cache but should still be in _redis_keys
+    assert len(cache._cache) == max_entries
+    assert len(cache._redis_keys) == total
+
+    cache.clear()
+
+    # All keys — including evicted ones — must have been passed to Redis delete
+    all_deleted: set[str] = set()
+    for call in mock_redis.delete.call_args_list:
+        all_deleted.update(call[0])
+    for i in range(total):
+        assert f"key{i}" in all_deleted

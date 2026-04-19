@@ -48,8 +48,10 @@ def test_custom_serializer(mock_redis):
     assert any(op == "deserialize" for op, _ in calls)
 
 
-def test_serializer_error_does_not_prevent_memory_write():
-    """If serializer raises during Redis write, memory still gets the data."""
+def test_serializer_error_propagates_to_caller():
+    """A serializer error is a caller mistake, not a Redis error — it propagates."""
+    import pytest
+
     def bad_serializer(data):
         raise TypeError("Cannot serialize")
 
@@ -59,6 +61,7 @@ def test_serializer_error_does_not_prevent_memory_write():
         default_ttl=300,
         serializer=bad_serializer,
     )
-    cache.set("k", {"v": 1})
-    full_key = cache._full_key("k")
-    assert cache._cache[full_key] == {"v": 1}
+    with pytest.raises(TypeError, match="Cannot serialize"):
+        cache.set("k", {"v": 1})
+    # Memory is also NOT written — the error is raised before any write
+    assert cache._full_key("k") not in cache._cache
