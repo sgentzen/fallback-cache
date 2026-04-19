@@ -56,7 +56,9 @@ def test_ttl_expiration():
     cache.set("key1", "value1")
     # Simulate time passing beyond TTL
     full_key = cache._full_key("key1")
-    cache._timestamps[full_key] -= 20  # 20s ago, TTL is 10s
+    # Backdate stored_at so the entry appears 20 s old (TTL is 10 s)
+    entry = cache._cache[full_key]
+    cache._cache[full_key] = entry._replace(stored_at=entry.stored_at - 20)
     assert cache.get("key1") is None
 
 
@@ -64,8 +66,10 @@ def test_per_key_ttl_overrides_default():
     cache = FallbackCache(default_ttl=10)
     cache.set("short", "val", ttl=1)
     cache.set("long", "val", ttl=9999)
-    for k in list(cache._timestamps):
-        cache._timestamps[k] -= 5
+    # Backdate stored_at by 5 s so "short" (ttl=1) expires but "long" (ttl=9999) does not
+    for k in list(cache._cache):
+        entry = cache._cache[k]
+        cache._cache[k] = entry._replace(stored_at=entry.stored_at - 5)
     assert cache.get("short") is None
     assert cache.get("long") == "val"
 
@@ -121,6 +125,24 @@ def test_stats_memory_mode():
     assert stats["entries"] == 2
     assert stats["max_entries"] == 50
     assert "oldest_age_seconds" in stats
+
+
+def test_stats_oldest_age_seconds_monotonic():
+    """oldest_age_seconds reflects time elapsed since the oldest entry was written."""
+    cache = FallbackCache(default_ttl=300)
+    cache.set("early", "value")
+    full_key = cache._full_key("early")
+
+    # Backdate the oldest entry's stored_at by a known delta
+    backdated_seconds = 42.0
+    entry = cache._cache[full_key]
+    cache._cache[full_key] = entry._replace(stored_at=entry.stored_at - backdated_seconds)
+
+    stats = cache.stats()
+    age = stats["oldest_age_seconds"]
+    assert isinstance(age, float), f"expected float, got {type(age)}"
+    assert age >= backdated_seconds, f"age {age:.2f}s < expected {backdated_seconds}s"
+    assert age < backdated_seconds + 5, f"age {age:.2f}s implausibly large (clock mismatch?)"
 
 
 def test_key_prefix_prepended():

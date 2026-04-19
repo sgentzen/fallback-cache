@@ -2,10 +2,11 @@
 from __future__ import annotations
 
 import logging
+import threading
+import time
 from collections import OrderedDict
 from collections.abc import Callable
-from datetime import datetime, timezone
-from typing import Any
+from typing import Any, NamedTuple
 
 from fallback_cache._circuit_breaker import CircuitBreaker
 from fallback_cache._keys import build_key as _build_key
@@ -50,10 +51,18 @@ class FallbackCache:
             cooldown=circuit_breaker_cooldown,
         )
 
-        # In-memory backend: OrderedDict for LRU ordering (most-recently-used at end)
-        self._cache: OrderedDict[str, Any] = OrderedDict()
-        self._timestamps: dict[str, float] = {}
-        self._ttls: dict[str, int] = {}
+        # In-memory backend: single OrderedDict for LRU ordering (MRU at end).
+        # RLock because public methods (e.g. set) may hold the lock while
+        # calling internal helpers (_memory_set) that also acquire it.
+        self._lock = threading.RLock()
+        self._cache: OrderedDict[str, _Entry] = OrderedDict()
+
+        # Tracks every full key successfully written to Redis (survives LRU eviction)
+        self._redis_keys: set[str] = set()
+
+        # Redis health counters (best-effort; always updated under self._lock)
+        self._redis_failures: int = 0
+        self._redis_last_error: str | None = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -75,6 +84,9 @@ class FallbackCache:
             except Exception:
                 self._breaker.record_failure()
                 logger.warning("Redis set failed for key %r", full_key, exc_info=True)
+                with self._lock:
+                    self._redis_failures += 1
+                    self._redis_last_error = repr(exc)
 
         # Always write to in-memory
         self._memory_set(full_key, data, effective_ttl)
@@ -94,6 +106,9 @@ class FallbackCache:
             except Exception:
                 self._breaker.record_failure()
                 logger.warning("Redis get failed for key %r", full_key, exc_info=True)
+                with self._lock:
+                    self._redis_failures += 1
+                    self._redis_last_error = repr(exc)
 
         return self._memory_get(full_key)
 
@@ -111,6 +126,9 @@ class FallbackCache:
             except Exception:
                 self._breaker.record_failure()
                 logger.warning("Redis delete failed for key %r", full_key, exc_info=True)
+                with self._lock:
+                    self._redis_failures += 1
+                    self._redis_last_error = repr(exc)
 
         if self._memory_delete(full_key):
             existed = True
@@ -120,6 +138,8 @@ class FallbackCache:
     def invalidate_prefix(self, prefix: str) -> None:
         """Delete all keys whose full key starts with key_prefix + prefix."""
         full_prefix = self._key_prefix + prefix
+        if not full_prefix:
+            raise ValueError("invalidate_prefix requires a non-empty prefix or key_prefix")
 
         if self._redis is not None and self._breaker.should_attempt():
             try:
@@ -139,17 +159,23 @@ class FallbackCache:
                     full_prefix,
                     exc_info=True,
                 )
+                with self._lock:
+                    self._redis_failures += 1
+                    self._redis_last_error = repr(exc)
 
         # Always clean memory
-        to_delete = [k for k in self._cache.keys() if k.startswith(full_prefix)]
-        for k in to_delete:
-            self._memory_delete(k)
+        with self._lock:
+            to_delete = [k for k in list(self._cache.keys()) if k.startswith(full_prefix)]
+            for k in to_delete:
+                self._cache.pop(k, None)
 
     def clear(self) -> None:
         """Remove all entries from both backends.
 
         Deletes only the keys tracked by this cache instance rather than
-        flushing the entire Redis database.
+        flushing the entire Redis database. If the Redis delete call raises,
+        the in-memory store is still cleared; a subsequent clear() will
+        retry the Redis deletion using the still-populated _redis_keys set.
         """
         if self._redis is not None and self._breaker.should_attempt():
             keys_to_delete = list(self._cache.keys())
@@ -206,7 +232,12 @@ class FallbackCache:
 
         None-valued params are excluded. Remaining params are sorted,
         JSON-serialized, and SHA-256 hashed (first 12 hex chars).
-        Returns 'prefix:<hash>'.
+        Returns ``'prefix:<hash>'``.
+
+        **Param contract:** all values must be JSON-serializable (str, int,
+        float, bool, None, list, dict with string keys). Sets, bare objects,
+        and other non-serializable types will raise ``TypeError``. If you need
+        to include a custom type, convert it to a string or dict first.
         """
         return _build_key(prefix, **params)
 
@@ -216,42 +247,40 @@ class FallbackCache:
 
     def _memory_set(self, full_key: str, data: Any, ttl: int) -> None:
         """Write to in-memory LRU cache, evicting LRU entry if at capacity."""
-        # If key already exists, remove it so we can re-insert at end (most recent)
-        if full_key in self._cache:
-            del self._cache[full_key]
-        elif len(self._cache) >= self._max_entries:
-            # Evict the least-recently-used (first) entry
-            evicted_key, _ = self._cache.popitem(last=False)
-            self._timestamps.pop(evicted_key, None)
-            self._ttls.pop(evicted_key, None)
+        with self._lock:
+            if full_key in self._cache:
+                del self._cache[full_key]
+            elif len(self._cache) >= self._max_entries:
+                # Evict the least-recently-used (first) entry
+                self._cache.popitem(last=False)
 
-        self._cache[full_key] = data
-        self._timestamps[full_key] = datetime.now(timezone.utc).timestamp()
-        self._ttls[full_key] = ttl
+            self._cache[full_key] = _Entry(
+                value=data,
+                stored_at=time.monotonic(),
+                ttl=ttl,
+            )
 
     def _memory_get(self, full_key: str) -> Any | None:
         """Read from in-memory cache with lazy TTL expiry and LRU promotion."""
-        if full_key not in self._cache:
-            return None
-
-        # Lazy TTL expiry
-        stored_at = self._timestamps.get(full_key)
-        ttl = self._ttls.get(full_key, self._default_ttl)
-        if stored_at is not None:
-            age = datetime.now(timezone.utc).timestamp() - stored_at
-            if age >= ttl:
-                self._memory_delete(full_key)
+        with self._lock:
+            entry = self._cache.get(full_key)
+            if entry is None:
                 return None
 
-        # Promote to most-recently-used position
-        self._cache.move_to_end(full_key)
-        return self._cache[full_key]
+            # Lazy TTL expiry
+            age = time.monotonic() - entry.stored_at
+            if age >= entry.ttl:
+                del self._cache[full_key]
+                return None
+
+            # Promote to most-recently-used position
+            self._cache.move_to_end(full_key)
+            return entry.value
 
     def _memory_delete(self, full_key: str) -> bool:
         """Remove a single key from in-memory storage. Returns True if it existed."""
-        if full_key not in self._cache:
-            return False
-        del self._cache[full_key]
-        self._timestamps.pop(full_key, None)
-        self._ttls.pop(full_key, None)
-        return True
+        with self._lock:
+            if full_key not in self._cache:
+                return False
+            del self._cache[full_key]
+            return True
