@@ -1,6 +1,24 @@
 # Changelog
 
-## 0.1.0 (Unreleased)
+## 0.1.1 - 2026-06-20
+
+### Bug Fixes
+
+- `get()` now keeps the in-memory fallback warm with actively-read keys by
+  promoting them on a Redis hit. The fallback stays warm with *hot* keys instead
+  of only the most recently *written* ones, so it is genuinely useful if Redis
+  later becomes unavailable. Expired in-memory copies are dropped rather than
+  promoted.
+- `set()` and `delete()` now mutate the internal Redis-key tracking set under the
+  lock. Previously a concurrent `clear()` / `invalidate_prefix()` rebuilding that
+  set could raise `RuntimeError: Set changed size during iteration`, which was
+  swallowed and miscounted as a Redis failure — a phantom outage with Redis
+  perfectly healthy.
+- Deserialization errors in `get()` now propagate to the caller instead of being
+  swallowed, miscounted as a Redis failure, and silently masked by the in-memory
+  copy. This mirrors `set()`, which already lets serialization errors propagate.
+
+## 0.1.0 - 2026-03-27
 
 - Initial release
 - `FallbackCache` class with Redis primary + in-memory LRU fallback

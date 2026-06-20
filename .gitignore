@@ -13,3 +13,4 @@ htmlcov/
 .env
 .venv/
 venv/
+.claude/.last-code-review
