@@ -1,7 +1,6 @@
 """Concurrency tests: interleaved set/get/delete across multiple threads."""
+import sys
 import threading
-
-import pytest
 
 from fallback_cache import FallbackCache
 
@@ -105,6 +104,57 @@ def test_concurrent_invalidate_prefix_no_exceptions():
 
     # All threads joined — reading cache state without lock is safe here
     assert errors == [], f"Threads raised exceptions: {errors}"
+
+
+def test_concurrent_set_and_invalidate_prefix_not_a_phantom_redis_failure(mock_redis):
+    """set() must mutate the shared _redis_keys set under the lock.
+
+    Otherwise a concurrent invalidate_prefix() rebuilding that set hits
+    'Set changed size during iteration'. invalidate_prefix() swallows that
+    RuntimeError in its broad ``except Exception`` and miscounts it as a Redis
+    failure -- so with a perfectly healthy Redis, redis_failures climbs above 0.
+    The switch interval is shortened to force the race to surface reliably.
+    """
+    cache = FallbackCache(redis_client=mock_redis, default_ttl=60)
+    errors: list[Exception] = []
+
+    # Seed a sizeable _redis_keys set so each rebuild spans several thread switches.
+    for i in range(5000):
+        cache.set(f"seed:key{i}", i)
+
+    def writer(tid: int) -> None:
+        try:
+            for i in range(2000):
+                cache.set(f"ns{tid}:key{i}", i)   # grows _redis_keys
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    def invalidator() -> None:
+        try:
+            for _ in range(3000):
+                # Matches nothing, so the full (growing) set is iterated each time.
+                cache.invalidate_prefix("nomatch:")
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    old_interval = sys.getswitchinterval()
+    sys.setswitchinterval(1e-7)
+    try:
+        threads = [threading.Thread(target=writer, args=(tid,)) for tid in range(8)]
+        threads.append(threading.Thread(target=invalidator))
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+    finally:
+        sys.setswitchinterval(old_interval)
+
+    assert errors == [], f"Threads raised exceptions: {errors}"
+    stats = cache.stats()
+    assert stats["redis_failures"] == 0, (
+        "internal _redis_keys race was miscounted as a Redis failure: "
+        f"{stats['redis_last_error']}"
+    )
 
 
 def test_concurrent_clear_no_exceptions():
