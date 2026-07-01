@@ -15,6 +15,14 @@ from fallback_cache._serializers import DEFAULT_DESERIALIZER, default_serializer
 logger = logging.getLogger(__name__)
 
 
+class _Entry(NamedTuple):
+    """Single in-memory cache record."""
+
+    value: Any
+    stored_at: float  # time.monotonic() at write time
+    ttl: int          # seconds until expiry
+
+
 class FallbackCache:
     """Cache with Redis primary and in-memory LRU fallback.
 
@@ -76,12 +84,16 @@ class FallbackCache:
 
         full_key = self._full_key(key)
 
-        # Try Redis first (best-effort)
+        # Try Redis first (best-effort).
+        # Serialization happens outside the try so a TypeError from bad input
+        # propagates to the caller rather than being miscounted as a Redis failure.
         if self._redis is not None and self._breaker.should_attempt():
+            serialized = self._serializer(data)
             try:
-                self._redis.setex(full_key, effective_ttl, self._serializer(data))
+                self._redis.setex(full_key, effective_ttl, serialized)
                 self._breaker.record_success()
-            except Exception:
+                self._redis_keys.add(full_key)
+            except Exception as exc:
                 self._breaker.record_failure()
                 logger.warning("Redis set failed for key %r", full_key, exc_info=True)
                 with self._lock:
@@ -103,7 +115,7 @@ class FallbackCache:
                 if raw is not None:
                     return self._deserializer(raw)
                 # Redis miss — fall through to memory
-            except Exception:
+            except Exception as exc:
                 self._breaker.record_failure()
                 logger.warning("Redis get failed for key %r", full_key, exc_info=True)
                 with self._lock:
@@ -123,7 +135,8 @@ class FallbackCache:
                 self._breaker.record_success()
                 if count and count > 0:
                     existed = True
-            except Exception:
+                self._redis_keys.discard(full_key)
+            except Exception as exc:
                 self._breaker.record_failure()
                 logger.warning("Redis delete failed for key %r", full_key, exc_info=True)
                 with self._lock:
@@ -152,7 +165,11 @@ class FallbackCache:
                     if cursor == 0:
                         break
                 self._breaker.record_success()
-            except Exception:
+                with self._lock:
+                    self._redis_keys = {
+                        k for k in self._redis_keys if not k.startswith(full_prefix)
+                    }
+            except Exception as exc:
                 self._breaker.record_failure()
                 logger.warning(
                     "Redis invalidate_prefix failed for prefix %r",
@@ -177,19 +194,26 @@ class FallbackCache:
         the in-memory store is still cleared; a subsequent clear() will
         retry the Redis deletion using the still-populated _redis_keys set.
         """
-        if self._redis is not None and self._breaker.should_attempt():
-            keys_to_delete = list(self._cache.keys())
-            if keys_to_delete:
-                try:
-                    self._redis.delete(*keys_to_delete)
-                    self._breaker.record_success()
-                except Exception:
-                    self._breaker.record_failure()
-                    logger.warning("Redis delete failed during clear()", exc_info=True)
+        # Snapshot the keys to purge and clear memory in one lock block so no
+        # concurrent set() can slip a key into _cache after we've cleared it.
+        with self._lock:
+            keys_to_delete = list(self._redis_keys | set(self._cache.keys()))
+            self._cache.clear()
 
-        self._cache.clear()
-        self._timestamps.clear()
-        self._ttls.clear()
+        # Redis I/O outside the lock; subtract only what we successfully deleted
+        # so any keys added by a concurrent set() after the snapshot are retained.
+        if self._redis is not None and keys_to_delete and self._breaker.should_attempt():
+            try:
+                self._redis.delete(*keys_to_delete)
+                self._breaker.record_success()
+                with self._lock:
+                    self._redis_keys -= set(keys_to_delete)
+            except Exception as exc:
+                self._breaker.record_failure()
+                logger.warning("Redis delete failed during clear()", exc_info=True)
+                with self._lock:
+                    self._redis_failures += 1
+                    self._redis_last_error = repr(exc)
 
     def stats(self) -> dict[str, Any]:
         """Return runtime statistics for the cache."""
@@ -200,12 +224,14 @@ class FallbackCache:
                 "backend": "redis",
                 "memory_entries": len(self._cache),
                 "key_prefix": self._key_prefix,
+                "redis_failures": self._redis_failures,
+                "redis_last_error": self._redis_last_error,
             })
         else:
             oldest_age: float | None = None
-            if self._timestamps:
-                now = datetime.now(timezone.utc).timestamp()
-                oldest_ts = min(self._timestamps.values())
+            if self._cache:
+                now = time.monotonic()
+                oldest_ts = min(entry.stored_at for entry in self._cache.values())
                 oldest_age = now - oldest_ts
 
             result.update({

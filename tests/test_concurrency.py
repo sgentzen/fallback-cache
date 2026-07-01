@@ -1,8 +1,6 @@
 """Concurrency tests: interleaved set/get/delete across multiple threads."""
 import threading
 
-import pytest
-
 from fallback_cache import FallbackCache
 
 _NUM_THREADS = 8
