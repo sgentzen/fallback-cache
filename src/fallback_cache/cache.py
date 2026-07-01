@@ -92,7 +92,10 @@ class FallbackCache:
             try:
                 self._redis.setex(full_key, effective_ttl, serialized)
                 self._breaker.record_success()
-                self._redis_keys.add(full_key)
+                # Mutate _redis_keys under the lock: a concurrent clear()/
+                # invalidate_prefix() rebuilds this set while holding self._lock.
+                with self._lock:
+                    self._redis_keys.add(full_key)
             except Exception as exc:
                 self._breaker.record_failure()
                 logger.warning("Redis set failed for key %r", full_key, exc_info=True)
@@ -111,16 +114,26 @@ class FallbackCache:
         if self._redis is not None and self._breaker.should_attempt():
             try:
                 raw = self._redis.get(full_key)
-                self._breaker.record_success()
-                if raw is not None:
-                    return self._deserializer(raw)
-                # Redis miss — fall through to memory
             except Exception as exc:
                 self._breaker.record_failure()
                 logger.warning("Redis get failed for key %r", full_key, exc_info=True)
                 with self._lock:
                     self._redis_failures += 1
                     self._redis_last_error = repr(exc)
+            else:
+                self._breaker.record_success()
+                if raw is not None:
+                    # Deserialize outside the except so a corrupt payload
+                    # propagates to the caller rather than being miscounted as a
+                    # Redis failure and silently masked by the in-memory copy
+                    # (mirrors set(), which serializes outside the try).
+                    value = self._deserializer(raw)
+                    # Keep the fallback warm with keys that are actively read,
+                    # not just recently written, so it stays useful if Redis
+                    # later fails.
+                    self._memory_promote(full_key)
+                    return value
+                # Redis miss — fall through to memory
 
         return self._memory_get(full_key)
 
@@ -135,7 +148,9 @@ class FallbackCache:
                 self._breaker.record_success()
                 if count and count > 0:
                     existed = True
-                self._redis_keys.discard(full_key)
+                # Mutate _redis_keys under the lock (see set() for rationale).
+                with self._lock:
+                    self._redis_keys.discard(full_key)
             except Exception as exc:
                 self._breaker.record_failure()
                 logger.warning("Redis delete failed for key %r", full_key, exc_info=True)
@@ -286,6 +301,11 @@ class FallbackCache:
                 ttl=ttl,
             )
 
+    @staticmethod
+    def _is_expired(entry: _Entry) -> bool:
+        """True if the entry's TTL has elapsed (monotonic clock)."""
+        return time.monotonic() - entry.stored_at >= entry.ttl
+
     def _memory_get(self, full_key: str) -> Any | None:
         """Read from in-memory cache with lazy TTL expiry and LRU promotion."""
         with self._lock:
@@ -294,14 +314,30 @@ class FallbackCache:
                 return None
 
             # Lazy TTL expiry
-            age = time.monotonic() - entry.stored_at
-            if age >= entry.ttl:
+            if self._is_expired(entry):
                 del self._cache[full_key]
                 return None
 
             # Promote to most-recently-used position
             self._cache.move_to_end(full_key)
             return entry.value
+
+    def _memory_promote(self, full_key: str) -> None:
+        """Promote an in-memory entry to most-recently-used after a Redis hit.
+
+        Keeps the fallback warm with actively-read keys so they survive LRU
+        eviction. An expired copy is dropped rather than promoted; it is not
+        repopulated from the Redis value because the remaining TTL is unknown
+        without an extra round trip.
+        """
+        with self._lock:
+            entry = self._cache.get(full_key)
+            if entry is None:
+                return
+            if self._is_expired(entry):
+                del self._cache[full_key]
+                return
+            self._cache.move_to_end(full_key)
 
     def _memory_delete(self, full_key: str) -> bool:
         """Remove a single key from in-memory storage. Returns True if it existed."""
