@@ -165,7 +165,7 @@ class FallbackCache:
 
         # Always clean memory
         with self._lock:
-            to_delete = [k for k in list(self._cache.keys()) if k.startswith(full_prefix)]
+            to_delete = [k for k in self._cache if k.startswith(full_prefix)]
             for k in to_delete:
                 self._cache.pop(k, None)
 
