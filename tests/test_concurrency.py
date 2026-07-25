@@ -106,6 +106,36 @@ def test_concurrent_invalidate_prefix_no_exceptions():
     assert errors == [], f"Threads raised exceptions: {errors}"
 
 
+def test_concurrent_clear_no_exceptions():
+    """clear() called concurrently with set/get does not raise."""
+    cache = FallbackCache(default_ttl=60, max_entries=100)
+    errors: list[Exception] = []
+
+    def setter(tid: int) -> None:
+        try:
+            for i in range(30):
+                cache.set(f"t{tid}-{i}", i)
+                cache.get(f"t{tid}-{i}")
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    def clearer() -> None:
+        try:
+            for _ in range(10):
+                cache.clear()
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=setter, args=(tid,)) for tid in range(6)]
+    threads.append(threading.Thread(target=clearer))
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert errors == [], f"Threads raised exceptions: {errors}"
+
+
 def test_concurrent_set_and_invalidate_prefix_not_a_phantom_redis_failure(mock_redis):
     """set() must mutate the shared _redis_keys set under the lock.
 
@@ -155,33 +185,3 @@ def test_concurrent_set_and_invalidate_prefix_not_a_phantom_redis_failure(mock_r
         "internal _redis_keys race was miscounted as a Redis failure: "
         f"{stats['redis_last_error']}"
     )
-
-
-def test_concurrent_clear_no_exceptions():
-    """clear() called concurrently with set/get does not raise."""
-    cache = FallbackCache(default_ttl=60, max_entries=100)
-    errors: list[Exception] = []
-
-    def setter(tid: int) -> None:
-        try:
-            for i in range(30):
-                cache.set(f"t{tid}-{i}", i)
-                cache.get(f"t{tid}-{i}")
-        except Exception as exc:  # noqa: BLE001
-            errors.append(exc)
-
-    def clearer() -> None:
-        try:
-            for _ in range(10):
-                cache.clear()
-        except Exception as exc:  # noqa: BLE001
-            errors.append(exc)
-
-    threads = [threading.Thread(target=setter, args=(tid,)) for tid in range(6)]
-    threads.append(threading.Thread(target=clearer))
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
-
-    assert errors == [], f"Threads raised exceptions: {errors}"

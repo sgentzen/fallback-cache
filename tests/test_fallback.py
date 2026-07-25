@@ -89,6 +89,23 @@ def test_dual_write_healthy_redis():
     assert "key1" in cache._cache
 
 
+def test_invalidate_prefix_raises_on_empty_prefix():
+    """invalidate_prefix with empty prefix and no key_prefix would wipe the DB."""
+    cache = FallbackCache(default_ttl=300)
+    with pytest.raises(ValueError, match="non-empty prefix"):
+        cache.invalidate_prefix("")
+
+
+def test_invalidate_prefix_empty_prefix_with_key_prefix_is_allowed():
+    """key_prefix alone is sufficient to scope the operation."""
+    cache = FallbackCache(default_ttl=300, key_prefix="app:")
+    cache.set("users:1", "alice")
+    cache.set("users:2", "bob")
+    cache.invalidate_prefix("")  # full_prefix == "app:" — safe
+    assert cache.get("users:1") is None
+    assert cache.get("users:2") is None
+
+
 def test_redis_hit_keeps_key_warm_in_memory_fallback(mock_redis):
     """A key read from Redis is promoted in the in-memory LRU so it survives
     eviction. The fallback should stay warm with the keys actually being *read*,
@@ -141,20 +158,3 @@ def test_redis_deserialize_error_propagates_and_is_not_a_redis_failure(mock_redi
     stats = cache.stats()
     assert stats["redis_failures"] == 0
     assert stats["redis_last_error"] is None
-
-
-def test_invalidate_prefix_raises_on_empty_prefix():
-    """invalidate_prefix with empty prefix and no key_prefix would wipe the DB."""
-    cache = FallbackCache(default_ttl=300)
-    with pytest.raises(ValueError, match="non-empty prefix"):
-        cache.invalidate_prefix("")
-
-
-def test_invalidate_prefix_empty_prefix_with_key_prefix_is_allowed():
-    """key_prefix alone is sufficient to scope the operation."""
-    cache = FallbackCache(default_ttl=300, key_prefix="app:")
-    cache.set("users:1", "alice")
-    cache.set("users:2", "bob")
-    cache.invalidate_prefix("")  # full_prefix == "app:" — safe
-    assert cache.get("users:1") is None
-    assert cache.get("users:2") is None

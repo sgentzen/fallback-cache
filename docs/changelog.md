@@ -33,7 +33,7 @@
   swallowed, miscounted as a Redis failure, and silently masked by the in-memory
   copy. This mirrors `set()`, which already lets serialization errors propagate.
 
-## 0.1.0 - 2026-03-27
+## 0.1.0
 
 - Initial release
 - `FallbackCache` class with Redis primary + in-memory LRU fallback
