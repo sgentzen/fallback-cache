@@ -1,5 +1,8 @@
 name: Manual SonarCloud Run
 
+permissions:
+  contents: read
+
 on:
   workflow_dispatch: # Enables manual triggering
 
