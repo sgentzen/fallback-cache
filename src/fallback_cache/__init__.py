@@ -1,6 +1,6 @@
 """fallback-cache: Redis-primary cache with transparent in-memory LRU fallback."""
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 from fallback_cache._keys import build_key
 from fallback_cache.async_cache import AsyncFallbackCache
