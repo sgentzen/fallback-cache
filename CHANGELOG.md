@@ -2,9 +2,13 @@
 
 ## 0.2.1 - 2026-07-26
 
-Repairs `0.2.0`, which was published in a non-functional state, and forward-ports
-the `0.1.1` correctness fixes onto the `0.2.x` line. **Anyone on `0.2.0` should
-upgrade.**
+Repairs the non-functional `0.2.0` and forward-ports the `0.1.1` correctness
+fixes onto the `0.2.x` line.
+
+`0.2.0` was tagged and released on GitHub but never reached PyPI — its publish
+run failed at the upload step — so `0.1.0` is still the only version on PyPI and
+`0.2.1` is the first working `0.2.x` available there. Anyone who installed
+`0.2.0` from the git tag should move to `0.2.1`.
 
 ### Fixed
 
@@ -46,8 +50,10 @@ upgrade.**
 
 ## 0.2.0
 
-> **Do not use this release.** It shipped non-functional — see `0.2.1`, which
-> repairs it. The features below are accurate but only work from `0.2.1` onward.
+> **Do not use this version.** The tagged code is non-functional — see `0.2.1`,
+> which repairs it. It was never published to PyPI (the publish run failed), so
+> it is only reachable by installing from the git tag. The features below are
+> accurate but only work from `0.2.1` onward.
 
 - `AsyncFallbackCache` for async/await usage with `redis.asyncio`
 - Built-in circuit breaker for both sync and async classes
@@ -63,6 +69,9 @@ upgrade.**
 - GitHub issue and PR templates
 
 ## 0.1.1 - 2026-06-20
+
+> Maintenance release on the `0.1.x` back-line, tagged on GitHub but not
+> published to PyPI. These fixes reach PyPI in `0.2.1`.
 
 ### Bug Fixes
 
