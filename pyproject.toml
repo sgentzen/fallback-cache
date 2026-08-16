@@ -34,6 +34,11 @@ dev = [
     "ruff>=0.8",
     "mypy>=1.13",
 ]
+build = [
+    "build>=1.5,<2",
+    "hatchling",
+    "editables>=0.5",
+]
 docs = [
     "mkdocs>=1.5",
     "mkdocs-material>=9.0",
