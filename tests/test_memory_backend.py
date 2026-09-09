@@ -67,7 +67,7 @@ def test_per_key_ttl_overrides_default():
     cache.set("short", "val", ttl=1)
     cache.set("long", "val", ttl=9999)
     # Backdate stored_at by 5 s so "short" (ttl=1) expires but "long" (ttl=9999) does not
-    for k in list(cache._cache):
+    for k in cache._cache:
         entry = cache._cache[k]
         cache._cache[k] = entry._replace(stored_at=entry.stored_at - 5)
     assert cache.get("short") is None
