@@ -277,3 +277,22 @@ async def test_key_prefix_applied():
     await cache.set("key1", "value1")
     assert "myapp:key1" in cache._cache
     assert await cache.get("key1") == "value1"
+
+
+@pytest.mark.asyncio
+async def test_invalidate_prefix_raises_on_empty_prefix():
+    """Without this guard the SCAN pattern is "*" and the whole DB is deleted."""
+    cache = AsyncFallbackCache(default_ttl=300)
+    with pytest.raises(ValueError, match="non-empty prefix"):
+        await cache.invalidate_prefix("")
+
+
+@pytest.mark.asyncio
+async def test_invalidate_prefix_empty_prefix_with_key_prefix_is_allowed():
+    """key_prefix alone is sufficient to scope the operation."""
+    cache = AsyncFallbackCache(default_ttl=300, key_prefix="app:")
+    await cache.set("users:1", "alice")
+    await cache.set("users:2", "bob")
+    await cache.invalidate_prefix("")  # full_prefix == "app:" — safe
+    assert await cache.get("users:1") is None
+    assert await cache.get("users:2") is None

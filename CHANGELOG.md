@@ -1,5 +1,39 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **`AsyncFallbackCache.invalidate_prefix("")` could delete the entire Redis
+  keyspace.** `FallbackCache` refused a prefix that resolves to empty, because
+  the resulting `SCAN` pattern is `*`; `AsyncFallbackCache` had no such guard,
+  so the same call on an async cache with no `key_prefix` walked and deleted
+  every key in the database, including any co-located non-cache data. The
+  guard now lives on the shared base, so neither class can lose it
+  independently. A configured `key_prefix` alone still scopes the call, as
+  before.
+
+### Changed
+
+- **Shared cache internals live in one place.** `FallbackCache` and
+  `AsyncFallbackCache` now inherit a private `_BaseCache` that owns the
+  constructor arguments and their validation, TTL resolution, and the
+  `_full_key` / `build_key` helpers. The two classes previously carried 46
+  duplicated lines between them, so the sync and async constructors could
+  drift apart silently. Each subclass now supplies only its own storage via a
+  `_init_storage()` hook.
+
+  No public API change: both classes keep exactly the same constructor
+  signature, defaults, and methods, and `build_key` still produces identical
+  keys from either class.
+
+### Removed
+
+- **The manual SonarCloud workflow.** `.github/workflows/sonarcloud.yml` ran
+  `npm ci` and `npm run test:coverage` against this Python project, which has
+  no `package.json`, so it could only ever fail. SonarCloud Automatic Analysis
+  already covers the repository.
+
 ## 0.2.1 - 2026-07-26
 
 Repairs the non-functional `0.2.0` and forward-ports the `0.1.1` correctness
