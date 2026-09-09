@@ -20,7 +20,8 @@ def _worker(cache: FallbackCache, thread_id: int, errors: list[Exception]) -> No
 
             result = cache.get(key)
             # May be None if another thread deleted it, but must not raise
-            assert result is None or isinstance(result, dict)
+            if not (result is None or isinstance(result, dict)):
+                raise ValueError(f"unexpected get() result: {result!r}")
 
             cache.get(shared_key)
 

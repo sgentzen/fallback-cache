@@ -12,6 +12,14 @@ source .venv/bin/activate  # or .venv\Scripts\activate on Windows
 pip install -e ".[dev,redis]"
 ```
 
+CI installs from the hash-locked `requirements-lock.txt` / `requirements-build-lock.txt` instead, for reproducibility. After changing a dependency in `pyproject.toml`, regenerate both with [uv](https://docs.astral.sh/uv/):
+
+```bash
+uv lock
+uv export --frozen --no-emit-project --extra dev --extra redis --extra build --format requirements.txt --output-file requirements-lock.txt
+uv export --frozen --no-emit-project --extra build --format requirements.txt --output-file requirements-build-lock.txt
+```
+
 ## Running Tests
 
 ```bash

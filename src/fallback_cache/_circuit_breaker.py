@@ -63,9 +63,7 @@ class CircuitBreaker:
         self._failure_count += 1
         self._last_failure_time = datetime.now(timezone.utc).timestamp()
 
-        if self._state is CircuitState.HALF_OPEN:
-            self._state = CircuitState.OPEN
-        elif self._failure_count >= self._threshold:
+        if self._state is CircuitState.HALF_OPEN or self._failure_count >= self._threshold:
             self._state = CircuitState.OPEN
 
     def stats(self) -> dict[str, Any]:
