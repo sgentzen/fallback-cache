@@ -5,12 +5,9 @@ import logging
 import threading
 import time
 from collections import OrderedDict
-from collections.abc import Callable
 from typing import Any, NamedTuple
 
-from fallback_cache._circuit_breaker import CircuitBreaker
-from fallback_cache._keys import build_key as _build_key
-from fallback_cache._serializers import DEFAULT_DESERIALIZER, default_serializer
+from fallback_cache._base import _BaseCache
 
 logger = logging.getLogger(__name__)
 
@@ -23,7 +20,7 @@ class _Entry(NamedTuple):
     ttl: int          # seconds until expiry
 
 
-class FallbackCache:
+class FallbackCache(_BaseCache):
     """Cache with Redis primary and in-memory LRU fallback.
 
     When a redis_client is provided, set() dual-writes to both Redis and
@@ -34,31 +31,7 @@ class FallbackCache:
     and automatically re-tests after a cooldown period.
     """
 
-    def __init__(
-        self,
-        redis_client: Any = None,
-        default_ttl: int = 300,
-        max_entries: int = 100,
-        key_prefix: str = "",
-        serializer: Callable[[Any], str | bytes] = default_serializer,
-        deserializer: Callable[[str | bytes], Any] = DEFAULT_DESERIALIZER,
-        circuit_breaker_threshold: int = 5,
-        circuit_breaker_cooldown: float = 30.0,
-    ) -> None:
-        if default_ttl <= 0:
-            raise ValueError(f"default_ttl must be positive, got {default_ttl}")
-
-        self._redis = redis_client
-        self._default_ttl = default_ttl
-        self._max_entries = max_entries
-        self._key_prefix = key_prefix
-        self._serializer = serializer
-        self._deserializer = deserializer
-        self._breaker = CircuitBreaker(
-            threshold=circuit_breaker_threshold,
-            cooldown=circuit_breaker_cooldown,
-        )
-
+    def _init_storage(self) -> None:
         # In-memory backend: single OrderedDict for LRU ordering (MRU at end).
         # RLock because public methods (e.g. set) may hold the lock while
         # calling internal helpers (_memory_set) that also acquire it.
@@ -78,10 +51,7 @@ class FallbackCache:
 
     def set(self, key: str, data: Any, ttl: int | None = None) -> None:
         """Store data under key with optional per-key TTL override."""
-        effective_ttl = ttl if ttl is not None else self._default_ttl
-        if effective_ttl <= 0:
-            raise ValueError(f"TTL must be positive, got {effective_ttl}")
-
+        effective_ttl = self._effective_ttl(ttl)
         full_key = self._full_key(key)
 
         # Try Redis first (best-effort).
@@ -165,14 +135,12 @@ class FallbackCache:
 
     def invalidate_prefix(self, prefix: str) -> None:
         """Delete all keys whose full key starts with key_prefix + prefix."""
-        full_prefix = self._key_prefix + prefix
-        if not full_prefix:
-            raise ValueError("invalidate_prefix requires a non-empty prefix or key_prefix")
+        full_prefix = self._full_prefix(prefix)
 
         if self._redis is not None and self._breaker.should_attempt():
             try:
                 cursor = 0
-                pattern = f"{full_prefix}*"
+                pattern = self._scan_pattern(full_prefix)
                 while True:
                     cursor, keys = self._redis.scan(cursor, match=pattern, count=100)
                     if keys:
@@ -234,53 +202,35 @@ class FallbackCache:
         """Return runtime statistics for the cache."""
         result: dict[str, Any] = {}
 
-        if self._redis is not None:
-            result.update({
-                "backend": "redis",
-                "memory_entries": len(self._cache),
-                "key_prefix": self._key_prefix,
-                "redis_failures": self._redis_failures,
-                "redis_last_error": self._redis_last_error,
-            })
-        else:
-            oldest_age: float | None = None
-            if self._cache:
-                now = time.monotonic()
-                oldest_ts = min(entry.stored_at for entry in self._cache.values())
-                oldest_age = now - oldest_ts
+        # Read shared in-memory state under the lock: len() and iteration over
+        # self._cache otherwise race with a concurrent set()/clear(), which can
+        # raise "dictionary changed size during iteration".
+        with self._lock:
+            if self._redis is not None:
+                result.update({
+                    "backend": "redis",
+                    "memory_entries": len(self._cache),
+                    "key_prefix": self._key_prefix,
+                    "redis_failures": self._redis_failures,
+                    "redis_last_error": self._redis_last_error,
+                })
+            else:
+                oldest_age: float | None = None
+                if self._cache:
+                    now = time.monotonic()
+                    oldest_ts = min(entry.stored_at for entry in self._cache.values())
+                    oldest_age = now - oldest_ts
 
-            result.update({
-                "backend": "memory",
-                "entries": len(self._cache),
-                "max_entries": self._max_entries,
-                "oldest_age_seconds": oldest_age,
-            })
+                result.update({
+                    "backend": "memory",
+                    "entries": len(self._cache),
+                    "max_entries": self._max_entries,
+                    "oldest_age_seconds": oldest_age,
+                })
 
+        # The breaker guards its own state; call it outside our lock.
         result.update(self._breaker.stats())
         return result
-
-    # ------------------------------------------------------------------
-    # Key helpers
-    # ------------------------------------------------------------------
-
-    def _full_key(self, key: str) -> str:
-        """Prepend key_prefix to the key if configured."""
-        return f"{self._key_prefix}{key}" if self._key_prefix else key
-
-    @staticmethod
-    def build_key(prefix: str, **params: Any) -> str:
-        """Build a deterministic, content-addressed cache key.
-
-        None-valued params are excluded. Remaining params are sorted,
-        JSON-serialized, and SHA-256 hashed (first 12 hex chars).
-        Returns ``'prefix:<hash>'``.
-
-        **Param contract:** all values must be JSON-serializable (str, int,
-        float, bool, None, list, dict with string keys). Sets, bare objects,
-        and other non-serializable types will raise ``TypeError``. If you need
-        to include a custom type, convert it to a string or dict first.
-        """
-        return _build_key(prefix, **params)
 
     # ------------------------------------------------------------------
     # In-memory backend internals

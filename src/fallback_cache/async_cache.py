@@ -3,18 +3,15 @@ from __future__ import annotations
 
 import logging
 from collections import OrderedDict
-from collections.abc import Callable
 from datetime import datetime, timezone
 from typing import Any
 
-from fallback_cache._circuit_breaker import CircuitBreaker
-from fallback_cache._keys import build_key as _build_key
-from fallback_cache._serializers import DEFAULT_DESERIALIZER, default_serializer
+from fallback_cache._base import _BaseCache
 
 logger = logging.getLogger(__name__)
 
 
-class AsyncFallbackCache:
+class AsyncFallbackCache(_BaseCache):
     """Async cache with Redis primary and in-memory LRU fallback.
 
     When a redis_client is provided, set() dual-writes to both Redis and
@@ -27,31 +24,7 @@ class AsyncFallbackCache:
     The redis_client should be a ``redis.asyncio.Redis`` instance.
     """
 
-    def __init__(
-        self,
-        redis_client: Any = None,
-        default_ttl: int = 300,
-        max_entries: int = 100,
-        key_prefix: str = "",
-        serializer: Callable[[Any], str | bytes] = default_serializer,
-        deserializer: Callable[[str | bytes], Any] = DEFAULT_DESERIALIZER,
-        circuit_breaker_threshold: int = 5,
-        circuit_breaker_cooldown: float = 30.0,
-    ) -> None:
-        if default_ttl <= 0:
-            raise ValueError(f"default_ttl must be positive, got {default_ttl}")
-
-        self._redis = redis_client
-        self._default_ttl = default_ttl
-        self._max_entries = max_entries
-        self._key_prefix = key_prefix
-        self._serializer = serializer
-        self._deserializer = deserializer
-        self._breaker = CircuitBreaker(
-            threshold=circuit_breaker_threshold,
-            cooldown=circuit_breaker_cooldown,
-        )
-
+    def _init_storage(self) -> None:
         self._cache: OrderedDict[str, Any] = OrderedDict()
         self._timestamps: dict[str, float] = {}
         self._ttls: dict[str, int] = {}
@@ -62,10 +35,7 @@ class AsyncFallbackCache:
 
     async def set(self, key: str, data: Any, ttl: int | None = None) -> None:
         """Store data under key with optional per-key TTL override."""
-        effective_ttl = ttl if ttl is not None else self._default_ttl
-        if effective_ttl <= 0:
-            raise ValueError(f"TTL must be positive, got {effective_ttl}")
-
+        effective_ttl = self._effective_ttl(ttl)
         full_key = self._full_key(key)
 
         if self._redis is not None and self._breaker.should_attempt():
@@ -116,12 +86,12 @@ class AsyncFallbackCache:
 
     async def invalidate_prefix(self, prefix: str) -> None:
         """Delete all keys whose full key starts with key_prefix + prefix."""
-        full_prefix = self._key_prefix + prefix
+        full_prefix = self._full_prefix(prefix)
 
         if self._redis is not None and self._breaker.should_attempt():
             try:
                 cursor = 0
-                pattern = f"{full_prefix}*"
+                pattern = self._scan_pattern(full_prefix)
                 while True:
                     cursor, keys = await self._redis.scan(cursor, match=pattern, count=100)
                     if keys:
@@ -183,19 +153,6 @@ class AsyncFallbackCache:
 
         result.update(self._breaker.stats())
         return result
-
-    # ------------------------------------------------------------------
-    # Key helpers
-    # ------------------------------------------------------------------
-
-    def _full_key(self, key: str) -> str:
-        """Prepend key_prefix to the key if configured."""
-        return f"{self._key_prefix}{key}" if self._key_prefix else key
-
-    @staticmethod
-    def build_key(prefix: str, **params: Any) -> str:
-        """Build a deterministic, content-addressed cache key."""
-        return _build_key(prefix, **params)
 
     # ------------------------------------------------------------------
     # In-memory backend internals

@@ -1,5 +1,78 @@
 # Changelog
 
+## Unreleased
+
+### Security
+
+- **A prefix containing glob characters no longer over-matches in Redis.**
+  `invalidate_prefix()` interpolated the caller's prefix straight into a Redis
+  `SCAN MATCH` pattern, so `*`, `?`, `[`, `]` and backslash were treated as
+  wildcards. An application building a prefix from request data — say
+  `invalidate_prefix(f"user:{user_id}:")` — could be made to purge far more
+  than it named by supplying `*` as the id. The prefix is now escaped and
+  matched literally.
+
+  This also settles a divergence between the two backends: the in-memory sweep
+  matches with `str.startswith`, which has no wildcards, so Redis and memory
+  previously deleted different key sets. A prefix of `x[0-9]:` was the starkest
+  case — Redis matched `x5:` and *missed* the literal `x[0-9]:` key that memory
+  removed.
+
+  If you relied on passing a glob to `invalidate_prefix()`, that no longer
+  works; prefixes are now literal.
+
+- **`build_key()` takes an optional `digest_length`.** The digest remains 12 hex
+  characters (48 bits) by default, so every existing key is byte-for-byte
+  unchanged and no deployed cache is invalidated by upgrading. 48 bits puts a
+  birthday collision at roughly `2**24` offline trials, which is not enough when
+  a param is attacker-controlled: whoever finds a colliding pair can seed the
+  entry another caller then reads. Pass a wider digest in that case:
+
+  ```python
+  key = build_key("search", 32, q=user_query, tenant=tenant_id)
+  ```
+
+  `prefix` and `digest_length` are positional-only, so neither name is reserved
+  and a param called either still gets hashed as an ordinary param. Note this
+  means the width must be passed **positionally**: written as a keyword it is
+  swallowed into `**params` and you get the default 12 characters. Widening
+  changes the key, so a cache written at one width will not read another.
+  A non-`int` width — including `True`, which is an `int` subclass and would
+  otherwise have truncated the digest to a single hex character — raises
+  `TypeError`.
+
+### Fixed
+
+- **`AsyncFallbackCache.invalidate_prefix("")` could delete the entire Redis
+  keyspace.** `FallbackCache` refused a prefix that resolves to empty, because
+  the resulting `SCAN` pattern is `*`; `AsyncFallbackCache` had no such guard,
+  so the same call on an async cache with no `key_prefix` walked and deleted
+  every key in the database, including any co-located non-cache data. The
+  guard now lives on the shared base, so neither class can lose it
+  independently. A configured `key_prefix` alone still scopes the call, as
+  before.
+
+### Changed
+
+- **Shared cache internals live in one place.** `FallbackCache` and
+  `AsyncFallbackCache` now inherit a private `_BaseCache` that owns the
+  constructor arguments and their validation, TTL resolution, and the
+  `_full_key` / `build_key` helpers. The two classes previously carried 46
+  duplicated lines between them, so the sync and async constructors could
+  drift apart silently. Each subclass now supplies only its own storage via a
+  `_init_storage()` hook.
+
+  No public API change: both classes keep exactly the same constructor
+  signature, defaults, and methods, and `build_key` still produces identical
+  keys from either class.
+
+### Removed
+
+- **The manual SonarCloud workflow.** `.github/workflows/sonarcloud.yml` ran
+  `npm ci` and `npm run test:coverage` against this Python project, which has
+  no `package.json`, so it could only ever fail. SonarCloud Automatic Analysis
+  already covers the repository.
+
 ## 0.2.1 - 2026-07-26
 
 Repairs the non-functional `0.2.0` and forward-ports the `0.1.1` correctness

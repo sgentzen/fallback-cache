@@ -1,5 +1,6 @@
 """Tests for Redis backend operations (via mock client)."""
 import json
+import re
 
 from fallback_cache import FallbackCache
 
@@ -177,3 +178,47 @@ def test_clear_deletes_evicted_redis_keys(mock_redis):
         all_deleted.update(call[0])
     for i in range(total):
         assert f"key{i}" in all_deleted
+
+
+def test_invalidate_prefix_escapes_glob_metacharacters(mock_redis):
+    """A prefix containing glob characters must match literally, not as a wildcard.
+
+    Unescaped, invalidate_prefix("user:*:") scans "user:*:*" and deletes every
+    user's keys rather than only those literally prefixed "user:*:". A prefix
+    built from request data ("user:{user_id}:") makes that reachable by
+    supplying "*" as the id.
+    """
+    cache = FallbackCache(redis_client=mock_redis, default_ttl=300)
+    cache.invalidate_prefix("user:*:")
+    assert mock_redis.scan.call_args.kwargs["match"] == r"user:\*:*"
+
+
+def test_invalidate_prefix_escapes_every_redis_metacharacter(mock_redis):
+    cache = FallbackCache(redis_client=mock_redis, default_ttl=300)
+    for prefix, expected in [
+        ("plain:", "plain:*"),
+        ("a?b:", r"a\?b:*"),
+        ("x[0-9]:", r"x\[0-9\]:*"),
+        ("back\\slash:", "back\\\\slash:*"),
+    ]:
+        cache.invalidate_prefix(prefix)
+        assert mock_redis.scan.call_args.kwargs["match"] == expected, prefix
+
+
+def test_invalidate_prefix_leaves_no_unescaped_wildcard_in_the_pattern(mock_redis):
+    """The blast-radius invariant: the only wildcard is the trailing one.
+
+    Asserted as an invariant rather than an exact string so it still holds if
+    the escaping strategy changes, and still fails if any caller-supplied
+    metacharacter reaches Redis unescaped.
+    """
+    cache = FallbackCache(redis_client=mock_redis, default_ttl=300)
+    for hostile in ("user:*:", "a?b:", "x[0-9]:", "*", "?", "[a-z]"):
+        cache.invalidate_prefix(hostile)
+        pattern = mock_redis.scan.call_args.kwargs["match"]
+
+        assert pattern.endswith("*"), hostile
+        body = pattern[:-1]
+        # Remove every escaped pair; nothing special may remain.
+        unescaped = re.sub(r"\\.", "", body)
+        assert not set(unescaped) & set("*?[]"), (hostile, pattern)
