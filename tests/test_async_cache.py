@@ -1,5 +1,6 @@
 """Tests for AsyncFallbackCache."""
 import json
+import re
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock
 
@@ -296,3 +297,113 @@ async def test_invalidate_prefix_empty_prefix_with_key_prefix_is_allowed():
     await cache.invalidate_prefix("")  # full_prefix == "app:" — safe
     assert await cache.get("users:1") is None
     assert await cache.get("users:2") is None
+
+
+@pytest.mark.asyncio
+async def test_invalidate_prefix_cleans_memory_when_redis_fails():
+    """A Redis outage during invalidate_prefix must not surface to the caller.
+
+    The in-memory sweep still has to run, or the fallback keeps serving entries
+    the caller just invalidated.
+    """
+    redis = _failing_async_redis()
+    cache = AsyncFallbackCache(redis_client=redis, default_ttl=300)
+    await cache.set("users:1", "alice")
+    await cache.set("users:2", "bob")
+    await cache.set("items:1", "widget")
+
+    await cache.invalidate_prefix("users:")   # must not raise
+
+    assert await cache.get("users:1") is None
+    assert await cache.get("users:2") is None
+    assert await cache.get("items:1") == "widget"
+    assert cache.stats()["circuit_breaker_failure_count"] > 0
+
+
+@pytest.mark.asyncio
+async def test_clear_cleans_memory_when_redis_fails():
+    """clear() must empty memory even when the Redis delete raises."""
+    redis = _failing_async_redis()
+    cache = AsyncFallbackCache(redis_client=redis, default_ttl=300)
+    await cache.set("a", 1)
+    await cache.set("b", 2)
+
+    await cache.clear()                       # must not raise
+
+    assert await cache.get("a") is None
+    assert await cache.get("b") is None
+    # A Redis-backed cache reports its in-memory size as "memory_entries".
+    stats = cache.stats()
+    assert stats["memory_entries"] == 0
+    # The failure was recorded, not merely swallowed by a bare except.
+    assert stats["circuit_breaker_failure_count"] > 0
+
+
+@pytest.mark.asyncio
+async def test_set_overwrites_existing_key_and_refreshes_lru_position():
+    """Re-setting a key replaces the value in place; it never evicts another key.
+
+    The overwritten key is deliberately *not* the least-recently-used one. If
+    the overwrite branch were dropped and every write went through eviction,
+    the cache would evict the LRU key ("a") to make room for a key it already
+    held — which overwriting the LRU key would have hidden, since evicting and
+    reinserting it yields the same state.
+    """
+    cache = AsyncFallbackCache(default_ttl=300, max_entries=3)
+    await cache.set("a", 1)
+    await cache.set("b", 2)
+    await cache.set("c", 3)                   # at capacity; LRU order a, b, c
+
+    await cache.set("b", 99)                  # overwrite the middle key
+    # Inspected directly rather than via get(), which would itself promote the
+    # key and reorder the very thing under test.
+    assert cache.stats()["entries"] == 3      # nothing was evicted
+    assert "a" in cache._cache                # the LRU key survived
+    assert cache._cache["b"] == 99
+
+    # The overwrite refreshed "b", so the next insert evicts "a", not "b".
+    await cache.set("d", 4)
+    assert "a" not in cache._cache
+    assert cache._cache["b"] == 99
+    assert cache._cache["d"] == 4
+
+
+@pytest.mark.asyncio
+async def test_invalidate_prefix_escapes_glob_metacharacters(mock_async_redis):
+    """A prefix containing glob characters must match literally, not as a wildcard.
+
+    Unescaped, `invalidate_prefix("user:*:")` scans `user:*:*` and deletes every
+    user's keys rather than the one literally named `user:*:`.
+    """
+    cache = AsyncFallbackCache(redis_client=mock_async_redis, default_ttl=300)
+    await cache.invalidate_prefix("user:*:")
+
+    pattern = mock_async_redis.scan.call_args.kwargs["match"]
+    assert pattern == r"user:\*:*"
+
+
+@pytest.mark.asyncio
+async def test_invalidate_prefix_escapes_every_redis_metacharacter(mock_async_redis):
+    """Mirrors the sync coverage so the two classes cannot drift apart."""
+    cache = AsyncFallbackCache(redis_client=mock_async_redis, default_ttl=300)
+    for prefix, expected in [
+        ("plain:", "plain:*"),
+        ("a?b:", r"a\?b:*"),
+        ("x[0-9]:", r"x\[0-9\]:*"),
+        ("back\\slash:", "back\\\\slash:*"),
+    ]:
+        await cache.invalidate_prefix(prefix)
+        assert mock_async_redis.scan.call_args.kwargs["match"] == expected, prefix
+
+
+@pytest.mark.asyncio
+async def test_invalidate_prefix_leaves_no_unescaped_wildcard_in_the_pattern(mock_async_redis):
+    """The blast-radius invariant: the only wildcard is the trailing one."""
+    cache = AsyncFallbackCache(redis_client=mock_async_redis, default_ttl=300)
+    for hostile in ("user:*:", "a?b:", "x[0-9]:", "*", "?", "[a-z]"):
+        await cache.invalidate_prefix(hostile)
+        pattern = mock_async_redis.scan.call_args.kwargs["match"]
+
+        assert pattern.endswith("*"), hostile
+        unescaped = re.sub(r"\\.", "", pattern[:-1])
+        assert not set(unescaped) & set("*?[]"), (hostile, pattern)

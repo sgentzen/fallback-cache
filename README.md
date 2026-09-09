@@ -71,7 +71,7 @@ result = cache.get("report:q1")   # returns from Redis; falls back to memory
 | `invalidate_prefix` | `invalidate_prefix(prefix)` | Delete all keys whose full key starts with `key_prefix + prefix`. Uses Redis `SCAN` to avoid blocking. |
 | `clear` | `clear()` | Remove all entries tracked by this instance (does not `FLUSHDB`). |
 | `stats` | `stats()` | Return a dict of runtime statistics (backend, entry count, circuit breaker state). |
-| `build_key` | `build_key(prefix, **params)` *(static)* | Build a deterministic SHA-256-based cache key: `"prefix:<12-hex-chars>"`. `None`-valued params are excluded. |
+| `build_key` | `build_key(prefix, digest_length=12, /, **params)` *(static)* | Build a deterministic SHA-256-based cache key: `"prefix:<12-hex-chars>"`. `None`-valued params are excluded. Pass a wider `digest_length` when any param is attacker-controlled. |
 
 ### Constructor parameters
 

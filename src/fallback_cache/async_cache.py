@@ -91,7 +91,7 @@ class AsyncFallbackCache(_BaseCache):
         if self._redis is not None and self._breaker.should_attempt():
             try:
                 cursor = 0
-                pattern = f"{full_prefix}*"
+                pattern = self._scan_pattern(full_prefix)
                 while True:
                     cursor, keys = await self._redis.scan(cursor, match=pattern, count=100)
                     if keys:

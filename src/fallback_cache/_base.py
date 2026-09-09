@@ -5,8 +5,13 @@ from collections.abc import Callable
 from typing import Any
 
 from fallback_cache._circuit_breaker import CircuitBreaker
+from fallback_cache._keys import DEFAULT_DIGEST_LENGTH
 from fallback_cache._keys import build_key as _build_key
 from fallback_cache._serializers import DEFAULT_DESERIALIZER, default_serializer
+
+# Redis glob metacharacters, per its stringmatchlen matcher. Each is escaped
+# with a backslash so a prefix containing one is matched literally.
+_GLOB_METACHARACTERS = str.maketrans({char: "\\" + char for char in r"\*?[]"})
 
 
 class _BaseCache:
@@ -62,6 +67,19 @@ class _BaseCache:
             raise ValueError(f"TTL must be positive, got {effective_ttl}")
         return effective_ttl
 
+    def _scan_pattern(self, full_prefix: str) -> str:
+        """Build a Redis ``SCAN MATCH`` pattern matching ``full_prefix`` literally.
+
+        Redis globs treat ``*``, ``?``, ``[``, ``]`` and backslash specially, so an
+        unescaped prefix carrying any of them matches more keys than the caller
+        named — ``invalidate_prefix(f"user:{user_id}:")`` with a ``user_id`` of
+        ``*`` would purge every user. Escaping also keeps the two backends in
+        step: the in-memory sweep matches with ``str.startswith``, which has no
+        wildcards, so an unescaped pattern made Redis and memory delete
+        different key sets.
+        """
+        return f"{full_prefix.translate(_GLOB_METACHARACTERS)}*"
+
     def _full_prefix(self, prefix: str) -> str:
         """Resolve a prefix for invalidation, refusing one that matches everything.
 
@@ -83,16 +101,16 @@ class _BaseCache:
         return f"{self._key_prefix}{key}" if self._key_prefix else key
 
     @staticmethod
-    def build_key(prefix: str, **params: Any) -> str:
+    def build_key(
+        prefix: str,
+        digest_length: int = DEFAULT_DIGEST_LENGTH,
+        /,
+        **params: Any,
+    ) -> str:
         """Build a deterministic, content-addressed cache key.
 
-        None-valued params are excluded. Remaining params are sorted,
-        JSON-serialized, and SHA-256 hashed (first 12 hex chars).
-        Returns ``'prefix:<hash>'``.
-
-        **Param contract:** all values must be JSON-serializable (str, int,
-        float, bool, None, list, dict with string keys). Sets, bare objects,
-        and other non-serializable types will raise ``TypeError``. If you need
-        to include a custom type, convert it to a string or dict first.
+        Exposed on both cache classes for convenience; see
+        :func:`fallback_cache.build_key` for the full contract, including the
+        collision-resistance note on ``digest_length`` and untrusted params.
         """
-        return _build_key(prefix, **params)
+        return _build_key(prefix, digest_length, **params)

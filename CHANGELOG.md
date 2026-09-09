@@ -2,6 +2,45 @@
 
 ## Unreleased
 
+### Security
+
+- **A prefix containing glob characters no longer over-matches in Redis.**
+  `invalidate_prefix()` interpolated the caller's prefix straight into a Redis
+  `SCAN MATCH` pattern, so `*`, `?`, `[`, `]` and backslash were treated as
+  wildcards. An application building a prefix from request data — say
+  `invalidate_prefix(f"user:{user_id}:")` — could be made to purge far more
+  than it named by supplying `*` as the id. The prefix is now escaped and
+  matched literally.
+
+  This also settles a divergence between the two backends: the in-memory sweep
+  matches with `str.startswith`, which has no wildcards, so Redis and memory
+  previously deleted different key sets. A prefix of `x[0-9]:` was the starkest
+  case — Redis matched `x5:` and *missed* the literal `x[0-9]:` key that memory
+  removed.
+
+  If you relied on passing a glob to `invalidate_prefix()`, that no longer
+  works; prefixes are now literal.
+
+- **`build_key()` takes an optional `digest_length`.** The digest remains 12 hex
+  characters (48 bits) by default, so every existing key is byte-for-byte
+  unchanged and no deployed cache is invalidated by upgrading. 48 bits puts a
+  birthday collision at roughly `2**24` offline trials, which is not enough when
+  a param is attacker-controlled: whoever finds a colliding pair can seed the
+  entry another caller then reads. Pass a wider digest in that case:
+
+  ```python
+  key = build_key("search", 32, q=user_query, tenant=tenant_id)
+  ```
+
+  `prefix` and `digest_length` are positional-only, so neither name is reserved
+  and a param called either still gets hashed as an ordinary param. Note this
+  means the width must be passed **positionally**: written as a keyword it is
+  swallowed into `**params` and you get the default 12 characters. Widening
+  changes the key, so a cache written at one width will not read another.
+  A non-`int` width — including `True`, which is an `int` subclass and would
+  otherwise have truncated the digest to a single hex character — raises
+  `TypeError`.
+
 ### Fixed
 
 - **`AsyncFallbackCache.invalidate_prefix("")` could delete the entire Redis
